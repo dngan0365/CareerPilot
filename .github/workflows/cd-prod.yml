@@ -1,0 +1,333 @@
+name: CD — Production
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com
+  EKS_CLUSTER: vonders-prod
+  K8S_NAMESPACE: production
+  TF_WORKING_DIR: infra/terraform
+
+jobs:
+  # ─── Detect changed services ──────────────────────────────────────────────────
+  detect-changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      frontend:          ${{ steps.filter.outputs.frontend }}
+      gateway:           ${{ steps.filter.outputs.gateway }}
+      user_service:      ${{ steps.filter.outputs.user_service }}
+      job_service:       ${{ steps.filter.outputs.job_service }}
+      interview_service: ${{ steps.filter.outputs.interview_service }}
+      cv_service:        ${{ steps.filter.outputs.cv_service }}
+      roadmap_service:   ${{ steps.filter.outputs.roadmap_service }}
+      crawler_worker:    ${{ steps.filter.outputs.crawler_worker }}
+      kafka_consumers:   ${{ steps.filter.outputs.kafka_consumers }}
+      shared:            ${{ steps.filter.outputs.shared }}
+      infra:             ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'apps/frontend/**'
+            gateway:
+              - 'apps/services/gateway/**'
+            user_service:
+              - 'apps/services/user_service/**'
+            job_service:
+              - 'apps/services/job_service/**'
+            interview_service:
+              - 'apps/services/interview_service/**'
+            cv_service:
+              - 'apps/services/cv_service/**'
+            roadmap_service:
+              - 'apps/services/roadmap_service/**'
+            crawler_worker:
+              - 'apps/services/crawler_worker/**'
+            kafka_consumers:
+              - 'apps/services/kafka_consumers/**'
+            shared:
+              - 'packages/**'
+            infra:
+              - 'infra/terraform/**'
+
+  # ─── Terraform apply (only if infra changed) ──────────────────────────────────
+  terraform:
+    name: Terraform apply
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.infra == 'true'
+    environment: production   # requires manual approval in GitHub env settings
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="environments/prod.tfvars" \
+            -out=tfplan \
+            -detailed-exitcode
+        continue-on-error: true  # exit code 2 = changes present (not failure)
+
+      - name: Check plan exit code
+        run: |
+          if [ "${{ steps.plan.outcome }}" == "failure" ]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Output cluster info
+        run: terraform output -json > /tmp/tf-outputs.json
+
+  # ─── Build all changed images and push to ECR ─────────────────────────────────
+  build-push:
+    name: Build & push — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes, terraform]
+    # Run even if terraform was skipped (no infra changes)
+    if: always() && !failure()
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: frontend
+            changed: ${{ needs.detect-changes.outputs.frontend }}
+            path: apps/frontend
+          - service: gateway
+            changed: ${{ needs.detect-changes.outputs.gateway }}
+            path: apps/services/gateway
+          - service: user-service
+            changed: ${{ needs.detect-changes.outputs.user_service }}
+            path: apps/services/user_service
+          - service: job-service
+            changed: ${{ needs.detect-changes.outputs.job_service }}
+            path: apps/services/job_service
+          - service: interview-service
+            changed: ${{ needs.detect-changes.outputs.interview_service }}
+            path: apps/services/interview_service
+          - service: cv-service
+            changed: ${{ needs.detect-changes.outputs.cv_service }}
+            path: apps/services/cv_service
+          - service: roadmap-service
+            changed: ${{ needs.detect-changes.outputs.roadmap_service }}
+            path: apps/services/roadmap_service
+          - service: crawler-worker
+            changed: ${{ needs.detect-changes.outputs.crawler_worker }}
+            path: apps/services/crawler_worker
+          - service: kafka-consumers
+            changed: ${{ needs.detect-changes.outputs.kafka_consumers }}
+            path: apps/services/kafka_consumers
+
+    if: matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true'
+
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: tag
+        run: |
+          SHORT_SHA=${GITHUB_SHA::8}
+          echo "tag=prod-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image=${{ env.ECR_REGISTRY }}/vonders-${{ matrix.service }}:prod-${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Build & push with layer caching
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.path }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.tag.outputs.image }}
+            ${{ env.ECR_REGISTRY }}/vonders-${{ matrix.service }}:prod-latest
+          build-args: |
+            ENVIRONMENT=production
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/vonders-${{ matrix.service }}:prod-latest
+          cache-to: type=inline
+
+  # ─── Deploy to EKS production ─────────────────────────────────────────────────
+  deploy:
+    name: Deploy — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-push]
+    environment: production
+    strategy:
+      # Deploy services in waves — gateway first, then the rest
+      max-parallel: 3
+      fail-fast: false
+      matrix:
+        include:
+          - service: gateway
+            changed: ${{ needs.detect-changes.outputs.gateway }}
+            port: 8000
+          - service: frontend
+            changed: ${{ needs.detect-changes.outputs.frontend }}
+            port: 3000
+          - service: user-service
+            changed: ${{ needs.detect-changes.outputs.user_service }}
+            port: 8000
+          - service: job-service
+            changed: ${{ needs.detect-changes.outputs.job_service }}
+            port: 8000
+          - service: interview-service
+            changed: ${{ needs.detect-changes.outputs.interview_service }}
+            port: 8000
+          - service: cv-service
+            changed: ${{ needs.detect-changes.outputs.cv_service }}
+            port: 8000
+          - service: roadmap-service
+            changed: ${{ needs.detect-changes.outputs.roadmap_service }}
+            port: 8000
+          - service: crawler-worker
+            changed: ${{ needs.detect-changes.outputs.crawler_worker }}
+            port: 8000
+          - service: kafka-consumers
+            changed: ${{ needs.detect-changes.outputs.kafka_consumers }}
+            port: 8000
+
+    if: matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER }}
+
+      - name: Set image tag
+        id: tag
+        run: |
+          SHORT_SHA=${GITHUB_SHA::8}
+          echo "image=${{ env.ECR_REGISTRY }}/vonders-${{ matrix.service }}:prod-${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Deploy rolling update
+        run: |
+          kubectl set image deployment/${{ matrix.service }} \
+            ${{ matrix.service }}=${{ steps.tag.outputs.image }} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+          kubectl rollout status deployment/${{ matrix.service }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=600s
+
+      - name: Smoke test
+        run: |
+          kubectl wait pod \
+            -l app=${{ matrix.service }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --for=condition=Ready \
+            --timeout=180s
+
+          POD=$(kubectl get pod \
+            -l app=${{ matrix.service }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          kubectl exec $POD -n ${{ env.K8S_NAMESPACE }} -- \
+            wget -qO- http://localhost:${{ matrix.port }}/health || exit 1
+
+          echo "✅ ${{ matrix.service }} is healthy"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deploy failed — rolling back ${{ matrix.service }}"
+          kubectl rollout undo deployment/${{ matrix.service }} \
+            -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout status deployment/${{ matrix.service }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=300s
+
+  # ─── Tag the release in Git ───────────────────────────────────────────────────
+  tag-release:
+    name: Tag release
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release tag
+        run: |
+          SHORT_SHA=${GITHUB_SHA::8}
+          DATE=$(date +%Y%m%d)
+          TAG="release-${DATE}-${SHORT_SHA}"
+          git tag $TAG
+          git push origin $TAG
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── Notify ───────────────────────────────────────────────────────────────────
+  notify:
+    name: Notify production result
+    runs-on: ubuntu-latest
+    needs: [deploy, tag-release]
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ needs.deploy.result == 'success' && '🚀' || '🔥' }} *Production deploy ${{ needs.deploy.result }}*\nCommit: `${{ github.sha }}`\nBy: ${{ github.actor }}\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
