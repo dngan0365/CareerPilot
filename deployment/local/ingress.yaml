@@ -1,0 +1,50 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: careerpilot-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api/users(/|$)(.*)        # → user-service
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 80
+
+          # - path: /api/cv(/|$)(.*)           # → cv-service
+          #   pathType: ImplementationSpecific
+          #   backend:
+          #     service:
+          #       name: cv-service
+          #       port:
+          #         number: 80
+
+          # - path: /api/jobs(/|$)             # → job-service
+          #   pathType: ImplementationSpecific
+          #   backend:
+          #     service:
+          #       name: job-service
+          #       port:
+          #         number: 80
+
+          # - path: /api/interviews(/|$)(.*)   # → interview-service
+          #   pathType: ImplementationSpecific
+          #   backend:
+          #     service:
+          #       name: interview-service
+          #       port:
+          #         number: 80
+
+          # - path: /api/roadmap(/|$)(.*)      # → roadmap-service
+          #   pathType: ImplementationSpecific
+          #   backend:
+          #     service:
+          #       name: roadmap-service
+          #       port:
+          #         number: 80
